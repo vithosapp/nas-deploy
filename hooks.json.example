@@ -1,8 +1,8 @@
 [
   {
     "id": "deploy-vitals",
-    "execute-command": "/data/data/com.termux/files/home/nas-deploy/deploy.sh",
-    "command-working-directory": "/data/data/com.termux/files/home/nas-deploy",
+    "execute-command": "/data/data/com.termux/files/home/nas/nas-deploy/deploy.sh",
+    "command-working-directory": "/data/data/com.termux/files/home/nas/nas-deploy",
     "response-message": "Deploy triggered",
     "trigger-rule": {
       "match": {
