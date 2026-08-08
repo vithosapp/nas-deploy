@@ -2,15 +2,18 @@
 
 Infrastructure for running the Vithos backend on an Android device using Termux.
 
-The setup turns an unused Android phone into a self-hosted backend node with:
+Turn an unused Android phone into a self-hosted backend node with automated deployments, public HTTPS access, remote administration, and uptime monitoring.
 
-* **Termux** for the runtime environment
-* **Cloudflare Tunnel** for public HTTPS access without port forwarding
-* **Tailscale** for private remote administration
-* **GitHub Actions** for deployments
-* **Termux:Boot** for startup after reboot
-* **tmux** for process supervision
-* **UptimeRobot** for availability monitoring
+## Features
+
+* **Always-on** — Starts automatically after reboot and keeps services running in the background.
+* **Public HTTPS** — Cloudflare Tunnel exposes the API without port forwarding.
+* **Automatic deployments** — GitHub Actions deploys every push to `main`.
+* **Remote administration** — Tailscale + SSH provides private access from anywhere.
+* **Process supervision** — Separate `tmux` sessions keep the API and infrastructure services running.
+* **Hardware telemetry** — An authenticated endpoint exposes battery, storage, memory, and CPU load from the phone.
+* **Uptime monitoring** — UptimeRobot monitors the API health endpoint.
+* **Zero hosting cost** — Runs on existing hardware using free-tier infrastructure services.
 
 The application itself lives in a separate repository. This repository contains only the scripts and configuration required to run and deploy it on the phone.
 
