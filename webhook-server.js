@@ -31,10 +31,17 @@ http.createServer((req, res) => {
     return;
   }
 
-  res.writeHead(202).end('deploy triggered');
-
-  exec(DEPLOY_SCRIPT, { shell: SHELL }, (err, stdout, stderr) => {
-    if (err) console.error('deploy failed:', err.message, stderr);
-    else console.log('deploy finished:', stdout);
-  });
+  exec(
+    DEPLOY_SCRIPT,
+    { shell: SHELL, maxBuffer: 10 * 1024 * 1024, timeout: 5 * 60 * 1000 },
+    (err, stdout, stderr) => {
+      if (err) {
+        console.error('deploy failed:', err.message, stderr);
+        res.writeHead(500, { 'Content-Type': 'text/plain' }).end(`deploy failed:\n${stdout}\n${stderr}`);
+        return;
+      }
+      console.log('deploy finished:', stdout);
+      res.writeHead(200, { 'Content-Type': 'text/plain' }).end(`deploy succeeded:\n${stdout}`);
+    }
+  );
 }).listen(PORT, () => console.log(`webhook listener on :${PORT}`));
