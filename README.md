@@ -137,6 +137,29 @@ ssh -p 8022 <user>@<tailscale-ip>
 
 This is independent of the Cloudflare Tunnel, so SSH access does not depend on the public application tunnel.
 
+### Hardware telemetry
+
+The deployment webhook also exposes device metrics:
+
+```text
+GET /stats
+```
+
+This returns battery, storage, memory, and CPU load information read directly from the phone:
+
+```json
+{
+  "battery": { "percentage": 87, "temperature": 31.2, "status": "CHARGING" },
+  "storage": { "totalMB": 25600, "usedMB": 18200, "availableMB": 7400 },
+  "memory": { "totalMB": 5820, "usedMB": 3110, "freeMB": 2710 },
+  "load": { "1m": 0.15, "5m": 0.2, "15m": 0.18 }
+}
+```
+
+Battery data requires the Termux:API app. Any command that fails or is unavailable (for example `free` without `procps` installed) resolves to `null` rather than failing the whole request.
+
+The route is protected by the same `X-Deploy-Secret` header as `/deploy`.
+
 ## Repository layout
 
 ```text
@@ -434,6 +457,7 @@ The three main access paths are also intentionally independent:
 | ------------------- | ----------------- | --------------------- |
 | Application traffic | Cloudflare Tunnel | Public HTTPS          |
 | Deployments         | Cloudflare Tunnel | Public HTTPS + secret |
+| Hardware telemetry  | Cloudflare Tunnel | Public HTTPS + secret |
 | Administration      | Tailscale + SSH   | Private network       |
 | Monitoring          | UptimeRobot       | Public HTTPS          |
 
