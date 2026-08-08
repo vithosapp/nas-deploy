@@ -1,134 +1,512 @@
 # nas-deploy
 
-**Turning a spare 2018 Android phone into a free, always-on, CI/CD-deployed backend host.**
+Infrastructure for running the Vithos backend on an Android device using Termux.
 
-This repo holds the infrastructure scripts — not application code — for running the [Vithos](https://vithos.in)'s backup backend on an old 8GB Honor phone sitting on a shelf at home, instead of paying for a cloud host. The phone runs the actual Node.js API 24/7, reachable from the public internet, auto-deploys on every `git push`, and survives reboots, crashes, and Android's aggressive background-process killing.
+The setup turns an unused Android phone into a self-hosted backend node with:
 
-Total hosting cost: **$0/month.** Everything here runs on free tiers (Cloudflare Tunnel, Tailscale, UptimeRobot) on top of hardware that was already sitting unused.
+* **Termux** for the runtime environment
+* **Cloudflare Tunnel** for public HTTPS access without port forwarding
+* **Tailscale** for private remote administration
+* **GitHub Actions** for deployments
+* **Termux:Boot** for startup after reboot
+* **tmux** for process supervision
+* **UptimeRobot** for availability monitoring
 
----
-
-## Features
-
-### 🏠 Always-on local server
-The backend (`pnpm start`) runs inside [Termux](https://termux.dev) on the phone, supervised by `tmux` sessions that survive SSH disconnects, and auto-started on every boot via [Termux:Boot](https://github.com/termux/termux-boot). A `termux-wake-lock` plus Android battery-optimization exemptions keep it running even with the screen off.
-
-### 🌍 Publicly reachable, zero port-forwarding
-[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) gives the phone a real public HTTPS hostname (`nasbackend.vithos.in`) without opening a single inbound port on the home router. The phone makes an *outbound* connection to Cloudflare's edge and keeps it open — this is what makes it work behind ordinary home NAT (or even CGNAT), unlike traditional dynamic-DNS + port-forwarding setups.
-
-### 🚀 CI/CD auto-deploy
-Every push to `main` triggers a GitHub Actions workflow that hits an authenticated webhook running on the phone, which pulls the latest code, rebuilds, and restarts the server — with the *real* build/deploy result (not just "request received") reported back into the Actions log.
-
-### 🔐 Remote admin access from anywhere ([Tailscale](https://tailscale.com))
-A private WireGuard mesh network between the phone and any of your own devices, giving the phone a permanent private IP reachable from anywhere in the world — independent of whatever local IP the phone's wifi happens to have. Deliberately kept **separate** from the Cloudflare Tunnel: if Cloudflare ever has an outage, you can still SSH into the phone to fix things, because admin access doesn't share a failure domain with the public app traffic.
-
-### 📈 Uptime monitoring
-[UptimeRobot](https://uptimerobot.com) polls the app's `/health` endpoint (which itself checks live Supabase and Redis connectivity, not just "is the process alive") and alerts on downtime — so a dropped connection is caught proactively instead of via a user complaint.
-
-### 🧩 Infra kept separate from app code
-This repo (`nas-deploy`) holds every phone-specific script — boot script, deploy script, webhook listener — entirely separate from the actual application repo. The app's source code has **zero** awareness it's running on a phone.
-
----
+The application itself lives in a separate repository. This repository contains only the scripts and configuration required to run and deploy it on the phone.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph gh[GitHub]
-        push[git push to main] --> actions[GitHub Actions]
+    subgraph github[GitHub]
+        push[git push main] --> actions[GitHub Actions]
     end
 
-    subgraph cf[Cloudflare Edge]
-        tunnel[Tunnel]
+    subgraph cloudflare[Cloudflare]
+        tunnel[Cloudflare Tunnel]
     end
 
-    subgraph phone[Phone — Termux]
+    subgraph phone[Android Phone]
         cloudflared[cloudflared]
-        vitals["vitals API :8000\n(tmux session)"]
-        webhook["webhook-server.js :9000\n(tmux session)"]
-        deploy[deploy.sh]
-        sshd[sshd :8022]
+
+        subgraph termux[Termux]
+            api["Vithos API :8000"]
+            webhook["Deploy webhook :9000"]
+            deploy[deploy.sh]
+            sshd[sshd :8022]
+        end
     end
 
-    subgraph services[Cloud Services]
-        supabase[(Supabase)]
-        redis[(Redis Cloud)]
-        mistral[Mistral AI]
-        resend[Resend]
-    end
-
-    frontend[Vercel Frontend] -->|nasbackend.vithos.in| tunnel
-    actions -->|POST /deploy, X-Deploy-Secret| tunnel
-    tunnel <-->|outbound, always-on| cloudflared
-    cloudflared --> vitals
+    frontend[Vercel] -->|HTTPS| tunnel
+    actions -->|POST /deploy| tunnel
+    tunnel --> cloudflared
+    cloudflared --> api
     cloudflared --> webhook
-    webhook -->|spawns| deploy
-    deploy -->|git pull, build, restart| vitals
+    webhook --> deploy
+    deploy -->|pull / build / restart| api
 
-    vitals --> supabase
-    vitals --> redis
-    vitals --> mistral
-    vitals --> resend
+    you[Admin device] -. Tailscale .-> sshd
 
-    you[You, anywhere] -.Tailscale private IP.-> sshd
+    api --> supabase[(Supabase)]
+    api --> redis[(Redis)]
+    api --> mistral[Mistral AI]
+    api --> resend[Resend]
 ```
 
----
+## How it works
 
-## Repo layout
+### Public traffic
 
-| File | Purpose |
-|---|---|
-| `start-vithos.sh` | Run by Termux:Boot on every reboot. Acquires a wake lock, starts `sshd`, and brings up the `vitals`, `tunnel`, and `webhook` tmux sessions. Symlinked from `~/.termux/boot/start-vithos.sh`. |
-| `deploy.sh` | Pulls latest `main`, `pnpm install && pnpm build`, then restarts only the `vitals` tmux session. Uses `set -e` — a broken build stops *before* touching the currently-running (working) session. |
-| `webhook-server.js` | A ~30-line dependency-free Node HTTP listener on port 9000. Verifies `X-Deploy-Secret` with a timing-safe comparison, then runs `deploy.sh` synchronously and returns its real exit status + output. |
-| `.env.example` | Template for the one secret this repo needs (`DEPLOY_SECRET`). The real `.env` is git-ignored and lives only on the phone. |
+The API runs locally on the phone:
 
----
+```text
+localhost:8000
+```
 
-## Setup guide
+Cloudflare Tunnel creates an outbound connection from the phone to Cloudflare's edge. Requests to:
 
-### 1. Base Termux environment
-- Install **Termux**, **Termux:API**, and **Termux:Boot** from F-Droid (not the Play Store build — it's been frozen since 2021).
-- `pkg install nodejs-lts git openssh`
-- `npm install -g corepack && corepack enable` — lets the exact `pnpm` version pinned in the app's `package.json` (`packageManager` field) run, matching its committed lockfile exactly, rather than whatever `pnpm` version happens to be newest.
-- `passwd` to set a login password, then `sshd` to start SSH on port 8022.
+```text
+https://nasbackend.vithos.in
+```
 
-### 2. Persistence (the hard part)
-Android — and Honor's Magic UI in particular — aggressively kills backgrounded apps. Getting this phone to actually stay up required layering multiple fixes:
-- `termux-wake-lock` (needs the Termux:API app) — prevents CPU sleep.
-- Standard Android: **Settings → Apps → Termux → Battery → Unrestricted.**
-- Honor-specific (the one that actually mattered most): **Settings → Battery → App launch → Termux** → turn off "Manage automatically" → enable Auto-launch / Secondary launch / Run in background. Repeat for **Termux:Boot** — it needs the same exemptions, separately.
-- **Open the Termux:Boot app manually at least once** after installing it. Android won't deliver the boot-completed broadcast to an app it's never seen launched.
-- Boot script lives at `~/nas/nas-deploy/start-vithos.sh`, symlinked into `~/.termux/boot/start-vithos.sh` so it stays version-controlled.
+are forwarded to the local API.
 
-### 3. Public reachability
-- `pkg install cloudflared`, `cloudflared tunnel login`, `cloudflared tunnel create <name>`.
-- `cloudflared tunnel route dns <name> nasbackend.vithos.in` and again for `deploynas.vithos.in`.
-- `~/.cloudflared/config.yml` maps both hostnames to their local ports (`8000` for the app, `9000` for the deploy webhook).
-- Run with `cloudflared tunnel run` inside its own `tmux` session.
+No inbound ports need to be opened on the home router, so the setup also works behind CGNAT.
 
-### 4. CI/CD
-- `webhook-server.js` and `deploy.sh` live in this repo, cloned onto the phone.
-- A GitHub Actions workflow (in the app repo) does one thing on push to `main`:
-  ```yaml
-  - run: |
-      response=$(curl -s -w "\n%{http_code}" --max-time 300 -X POST https://deploynas.vithos.in/deploy \
-        -H "X-Deploy-Secret: ${{ secrets.DEPLOY_SECRET }}")
-      http_code=$(echo "$response" | tail -n1)
-      body=$(echo "$response" | sed '$d')
-      echo "$body"
-      if [ "$http_code" != "200" ]; then exit 1; fi
-  ```
-- `DEPLOY_SECRET` is stored as a GitHub Actions repo secret **and** in a git-ignored `.env` on the phone — never committed.
+The deployment webhook uses a separate hostname:
 
-> ⚠️ **Lesson learned the hard way:** the original webhook used the popular Go-based `adnanh/webhook` tool. It crashed with `SIGSYS` on every single trigger — Android's kernel seccomp filter blocks the `faccessat2` syscall that Go 1.21+'s `os/exec.LookPath` uses internally, and there's no way to configure around it. Swapped it for the tiny hand-rolled Node listener in this repo instead, since Node's own shell/exec path doesn't hit that syscall.
+```text
+https://deploynas.vithos.in
+```
 
-### 5. Remote admin access
-- Install Tailscale on the phone (Play Store) and on your other devices, sign into the same account.
-- `sshd` already listens on all interfaces, so it's automatically reachable on the phone's new Tailscale IP — no extra config.
-- Same Honor battery/app-launch exemptions as step 2 apply to the Tailscale app too.
+which forwards to:
 
-### 6. Monitoring
-- Add an UptimeRobot monitor (free tier) pointed at `https://nasbackend.vithos.in/health`, checked every few minutes.
+```text
+localhost:9000
+```
 
+### Deployments
+
+A push to `main` triggers GitHub Actions.
+
+The workflow sends an authenticated request to the deployment webhook:
+
+```text
+GitHub Actions
+      │
+      ▼
+POST /deploy
+      │
+      ▼
+webhook-server.js
+      │
+      ▼
+deploy.sh
+      │
+      ├── git pull
+      ├── pnpm install
+      ├── pnpm build
+      └── restart API
+```
+
+The deployment script uses `set -e`, so a failed install or build exits before the running API process is replaced.
+
+The GitHub Actions job receives the deployment command's HTTP status and output.
+
+### Process management
+
+The phone uses separate `tmux` sessions for:
+
+* `vitals` — Vithos API
+* `tunnel` — Cloudflare Tunnel
+* `webhook` — deployment webhook
+
+This allows processes to continue running after an SSH session disconnects.
+
+`Termux:Boot` runs `start-vithos.sh` after Android boots and recreates the required sessions.
+
+### Remote administration
+
+Tailscale provides private network access to the phone.
+
+SSH is exposed only through the Tailscale network for administration:
+
+```bash
+ssh -p 8022 <user>@<tailscale-ip>
+```
+
+This is independent of the Cloudflare Tunnel, so SSH access does not depend on the public application tunnel.
+
+## Repository layout
+
+```text
+nas-deploy/
+├── start-vithos.sh
+├── deploy.sh
+├── webhook-server.js
+├── .env.example
+└── README.md
+```
+
+| File                | Description                                                                                                |
+| ------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `start-vithos.sh`   | Boot script used by Termux:Boot. Acquires a wake lock, starts SSH, and creates the required tmux sessions. |
+| `deploy.sh`         | Pulls the latest application code, installs dependencies, builds the application, and restarts the API.    |
+| `webhook-server.js` | Minimal Node.js HTTP server that authenticates deployment requests and executes `deploy.sh`.               |
+| `.env.example`      | Environment variable template for the deployment secret.                                                   |
+
+## Requirements
+
+### Hardware
+
+* Android phone
+* Wi-Fi or another persistent network connection
+* Device capable of running Node.js through Termux
+* Device connected to power for continuous operation
+
+The reference setup uses an **Honor phone with 8 GB RAM**.
+
+### Software
+
+* Termux
+* Termux:API
+* Termux:Boot
+* Node.js
+* Git
+* OpenSSH
+* Corepack / pnpm
+* Cloudflare account
+* Tailscale account
+* GitHub repository with Actions enabled
+
+## Installation
+
+### 1. Install Termux
+
+Install Termux, Termux:API, and Termux:Boot from F-Droid.
+
+Then install the required packages:
+
+```bash
+pkg update
+pkg install nodejs-lts git openssh
+```
+
+Enable Corepack:
+
+```bash
+npm install -g corepack
+corepack enable
+```
+
+The application repository's `packageManager` field should determine the pnpm version used during deployment.
+
+Initialize SSH:
+
+```bash
+passwd
+sshd
+```
+
+Termux's SSH server listens on port `8022` by default.
+
+### 2. Clone this repository
+
+```bash
+git clone <repository-url> ~/nas/nas-deploy
+cd ~/nas/nas-deploy
+```
+
+Create the environment file:
+
+```bash
+cp .env.example .env
+```
+
+Set the deployment secret:
+
+```env
+DEPLOY_SECRET=<random-secret>
+```
+
+Keep `.env` out of version control.
+
+### 3. Configure the application
+
+Clone the application repository to the location expected by `deploy.sh`.
+
+The deployment script assumes the application is a Node.js project using pnpm and exposes the API through the configured port.
+
+Adjust the paths and commands in `deploy.sh` if your application differs.
+
+### 4. Configure startup
+
+Create the Termux:Boot directory:
+
+```bash
+mkdir -p ~/.termux/boot
+```
+
+Create a symlink to the version-controlled boot script:
+
+```bash
+ln -s ~/nas/nas-deploy/start-vithos.sh \
+      ~/.termux/boot/start-vithos.sh
+```
+
+The boot script starts:
+
+1. SSH
+2. the application
+3. Cloudflare Tunnel
+4. the deployment webhook
+
+### 5. Prevent Android from stopping the services
+
+Android may suspend or terminate Termux when the device is idle.
+
+Acquire a wake lock:
+
+```bash
+termux-wake-lock
+```
+
+Also disable battery optimization for:
+
+* Termux
+* Termux:Boot
+* Tailscale
+
+On Honor devices, configure:
+
+```text
+Settings
+→ Battery
+→ App launch
+→ Termux
+```
+
+Disable automatic management and allow:
+
+* Auto-launch
+* Secondary launch
+* Run in background
+
+Apply the same configuration to Termux:Boot and Tailscale.
+
+Launch Termux:Boot manually once after installation so Android registers the application correctly for boot events.
+
+### 6. Configure Cloudflare Tunnel
+
+Install `cloudflared`:
+
+```bash
+pkg install cloudflared
+```
+
+Authenticate:
+
+```bash
+cloudflared tunnel login
+```
+
+Create a tunnel:
+
+```bash
+cloudflared tunnel create <tunnel-name>
+```
+
+Configure the hostnames to forward to the local services:
+
+```text
+nasbackend.vithos.in → localhost:8000
+deploynas.vithos.in  → localhost:9000
+```
+
+Run the tunnel in its own tmux session:
+
+```bash
+tmux new-session -d -s tunnel 'cloudflared tunnel run <tunnel-name>'
+```
+
+The tunnel should also be started automatically by `start-vithos.sh`.
+
+### 7. Configure GitHub Actions
+
+Store the deployment secret as a repository secret:
+
+```text
+DEPLOY_SECRET
+```
+
+The workflow can then trigger deployments with:
+
+```yaml
+- name: Deploy
+  run: |
+    response=$(curl -s -w "\n%{http_code}" \
+      --max-time 300 \
+      -X POST \
+      https://deploynas.vithos.in/deploy \
+      -H "X-Deploy-Secret: ${{ secrets.DEPLOY_SECRET }}")
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    echo "$body"
+
+    if [ "$http_code" != "200" ]; then
+      exit 1
+    fi
+```
+
+The same secret must exist in the phone's `.env` file.
+
+### 8. Configure Tailscale
+
+Install Tailscale on the phone and on the devices used for administration.
+
+Once connected, the phone can be accessed through its Tailscale address:
+
+```bash
+ssh -p 8022 <user>@<tailscale-ip>
+```
+
+No router port forwarding is required.
+
+### 9. Configure monitoring
+
+Create an HTTP monitor for:
+
+```text
+https://nasbackend.vithos.in/health
+```
+
+The `/health` endpoint should verify the API's required external dependencies rather than only checking whether the process is running.
+
+## Deployment
+
+Normal deployments require no manual interaction.
+
+```text
+git push origin main
+        │
+        ▼
+GitHub Actions
+        │
+        ▼
+Cloudflare Tunnel
+        │
+        ▼
+webhook-server.js
+        │
+        ▼
+deploy.sh
+        │
+        ├── git pull
+        ├── pnpm install
+        ├── pnpm build
+        └── restart
+```
+
+To deploy manually from the phone:
+
+```bash
+cd ~/nas/nas-deploy
+./deploy.sh
+```
+
+## Failure handling
+
+The deployment process intentionally builds before restarting the running service.
+
+```bash
+set -e
+```
+
+If `pnpm install` or `pnpm build` fails, the script exits without restarting the existing API process.
+
+This prevents a failed deployment from replacing a working version with an unbuildable one.
+
+The three main access paths are also intentionally independent:
+
+| Purpose             | Service           | Network               |
+| ------------------- | ----------------- | --------------------- |
+| Application traffic | Cloudflare Tunnel | Public HTTPS          |
+| Deployments         | Cloudflare Tunnel | Public HTTPS + secret |
+| Administration      | Tailscale + SSH   | Private network       |
+| Monitoring          | UptimeRobot       | Public HTTPS          |
+
+## Security
+
+The deployment endpoint is publicly reachable through Cloudflare, but deployment requests require the `X-Deploy-Secret` header.
+
+The secret is stored in:
+
+* GitHub Actions repository secrets
+* the phone's git-ignored `.env`
+
+It is never committed to the repository.
+
+SSH is intended to be accessed through Tailscale rather than exposed through the public internet.
+
+## Android compatibility
+
+This setup relies on Android allowing Termux to remain active in the background.
+
+Different manufacturers apply different background-process policies. The reference device is an Honor phone, where battery optimization and application-launch settings need to be configured explicitly.
+
+If the API stops after several hours, check:
+
+1. Battery optimization
+2. Background execution permissions
+3. Auto-launch permissions
+4. Termux:Boot permissions
+5. Whether the device has entered an aggressive power-saving mode
+6. Whether the phone is connected to a stable power source
+
+## Known issue: `adnanh/webhook`
+
+The initial implementation used [`adnanh/webhook`](https://github.com/adnanh/webhook) as the deployment listener.
+
+On the reference Android/Termux environment, the binary terminated with:
+
+```text
+SIGSYS
+```
+
+The failure was caused by Android's syscall restrictions interacting with the Go runtime's process execution path.
+
+The webhook listener was therefore replaced with `webhook-server.js`, a small dependency-free Node.js HTTP server.
+
+This also keeps the deployment endpoint implementation inside this repository rather than introducing another binary dependency.
+
+## Why a phone?
+
+For workloads that do not require significant CPU or memory, an unused Android phone can be a practical self-hosting node.
+
+Advantages:
+
+* Existing hardware
+* Very low power consumption
+* Built-in battery backup
+* Wi-Fi connectivity
+* No recurring compute cost
+* Can operate behind CGNAT
+* Easy physical access
+
+Limitations:
+
+* Android background-process restrictions
+* Limited CPU/RAM compared with a VPS
+* Storage reliability
+* Wi-Fi dependency
+* Device battery degradation
+* Manufacturer-specific power management
+
+This setup is intended for small services and personal infrastructure rather than workloads requiring production-grade compute, storage, or availability guarantees.
+
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
