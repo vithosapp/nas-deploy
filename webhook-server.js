@@ -19,29 +19,99 @@ function secretsMatch(a, b) {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-http.createServer((req, res) => {
-  if (req.method !== 'POST' || req.url !== '/deploy') {
-    res.writeHead(404).end();
-    return;
-  }
+function isAuthorized(req) {
+  return secretsMatch(req.headers['x-deploy-secret'] || '', SECRET);
+}
 
-  const provided = req.headers['x-deploy-secret'] || '';
-  if (!secretsMatch(provided, SECRET)) {
-    res.writeHead(401).end('unauthorized');
-    return;
-  }
+function run(cmd) {
+  return new Promise((resolve) => {
+    exec(cmd, { shell: SHELL, timeout: 10 * 1000 }, (err, stdout) => {
+      resolve(err ? null : stdout.trim());
+    });
+  });
+}
 
-  exec(
-    DEPLOY_SCRIPT,
-    { shell: SHELL, maxBuffer: 10 * 1024 * 1024, timeout: 5 * 60 * 1000 },
-    (err, stdout, stderr) => {
-      if (err) {
-        console.error('deploy failed:', err.message, stderr);
-        res.writeHead(500, { 'Content-Type': 'text/plain' }).end(`deploy failed:\n${stdout}\n${stderr}`);
-        return;
-      }
-      console.log('deploy finished:', stdout);
-      res.writeHead(200, { 'Content-Type': 'text/plain' }).end(`deploy succeeded:\n${stdout}`);
+async function getStats() {
+  const [batteryRaw, dfRaw, loadavgRaw, freeRaw] = await Promise.all([
+    run('termux-battery-status'),
+    run(`df -k ${process.env.HOME}`),
+    run('cat /proc/loadavg'),
+    run('free -k'),
+  ]);
+
+  let battery = null;
+  if (batteryRaw) {
+    try {
+      battery = JSON.parse(batteryRaw);
+    } catch {
+      battery = null;
     }
-  );
+  }
+
+  let storage = null;
+  const dfLine = dfRaw && dfRaw.split('\n')[1];
+  if (dfLine) {
+    const parts = dfLine.trim().split(/\s+/);
+    storage = {
+      totalMB: Math.round(Number(parts[1]) / 1024),
+      usedMB: Math.round(Number(parts[2]) / 1024),
+      availableMB: Math.round(Number(parts[3]) / 1024),
+      usePercent: parts[4],
+    };
+  }
+
+  let load = null;
+  if (loadavgRaw) {
+    const [one, five, fifteen] = loadavgRaw.split(' ');
+    load = { '1m': Number(one), '5m': Number(five), '15m': Number(fifteen) };
+  }
+
+  let memory = null;
+  const freeLine = freeRaw && freeRaw.split('\n')[1];
+  if (freeLine) {
+    const parts = freeLine.trim().split(/\s+/);
+    memory = {
+      totalMB: Math.round(Number(parts[1]) / 1024),
+      usedMB: Math.round(Number(parts[2]) / 1024),
+      freeMB: Math.round(Number(parts[3]) / 1024),
+    };
+  }
+
+  return { battery, storage, memory, load, timestamp: new Date().toISOString() };
+}
+
+http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/stats') {
+    if (!isAuthorized(req)) {
+      res.writeHead(401).end('unauthorized');
+      return;
+    }
+    getStats().then((stats) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(stats));
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/deploy') {
+    if (!isAuthorized(req)) {
+      res.writeHead(401).end('unauthorized');
+      return;
+    }
+    exec(
+      DEPLOY_SCRIPT,
+      { shell: SHELL, maxBuffer: 10 * 1024 * 1024, timeout: 5 * 60 * 1000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          console.error('deploy failed:', err.message, stderr);
+          res.writeHead(500, { 'Content-Type': 'text/plain' }).end(`deploy failed:\n${stdout}\n${stderr}`);
+          return;
+        }
+        console.log('deploy finished:', stdout);
+        res.writeHead(200, { 'Content-Type': 'text/plain' }).end(`deploy succeeded:\n${stdout}`);
+      }
+    );
+    return;
+  }
+
+  res.writeHead(404).end();
 }).listen(PORT, () => console.log(`webhook listener on :${PORT}`));
