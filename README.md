@@ -1,6 +1,18 @@
+<img
+  src="https://github.com/user-attachments/assets/ec9e19ae-e99b-49a6-b897-75ba15258f6b"
+  alt="Android phone running the Vithos backend"
+  width="300"
+  align="right"
+/>
+
 # nas-deploy
 
-Infrastructure for running the Vithos backend on an Android device using Termux.
+**Turning a spare 2018 Android phone into a free, always-on,
+CI/CD-deployed backend host.**
+
+Infrastructure for running the Vithos backend on an Android
+device using Termux.
+
 
 Turn an unused Android phone into a self-hosted backend node with automated deployments, public HTTPS access, remote administration, and uptime monitoring.
 
